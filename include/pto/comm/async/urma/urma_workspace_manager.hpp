@@ -95,31 +95,6 @@ public:
         initialized_ = false;
     }
 
-    // The owning device generation has already been reset or irreversibly
-    // quarantined. Its device/HCCL handles must no longer be touched. Forget
-    // device-side ownership so later Finalize()/destruction cannot issue
-    // cleanup calls against stale handles.
-    void AbandonAfterDeviceReset() noexcept
-    {
-        comm_ = nullptr;
-        rankId_ = 0;
-        rankCount_ = 0;
-        symmetricAddr_ = nullptr;
-        symmetricSize_ = 0;
-        memHandle_ = nullptr;
-        notifyMemHandle_ = nullptr;
-        for (auto& handle : memHandles_) {
-            handle = nullptr;
-        }
-        channelHandles_.clear();
-        urmaInfoDevice_ = nullptr;
-        eidDevice_ = nullptr;
-        notifyPoolDevice_ = nullptr;
-        notifyPoolSize_ = 0;
-        peerBaseAddrs_.clear();
-        initialized_ = false;
-    }
-
     void* GetWorkspaceAddr() const { return urmaInfoDevice_; }
 
     // Per-peer symmetric MR base address (self = symmetricAddr_). Valid after Init().

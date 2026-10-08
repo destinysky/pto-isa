@@ -146,24 +146,6 @@ public:
         inited_ = false;
     }
 
-    // The owning device generation has already been reset or irreversibly
-    // quarantined. Its device/runtime handles must no longer be touched.
-    // Forget device-side ownership so later Finalize()/destruction cannot
-    // issue cleanup calls against stale handles.
-    void AbandonAfterDeviceReset() noexcept
-    {
-        streamsDevicePtr_ = nullptr;
-        opResDevicePtr_ = nullptr;
-        for (auto& stream : streams_) {
-            stream.stream_ = 0;
-            stream.ctx_ = 0;
-        }
-        streams_.clear();
-        opResInfo_ = {};
-        CloseDynamicLibs();
-        inited_ = false;
-    }
-
     void* GetWorkspaceAddr() const { return reinterpret_cast<void*>(opResInfo_.workspace_addr); }
 
 private:
