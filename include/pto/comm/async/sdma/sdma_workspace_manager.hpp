@@ -465,6 +465,10 @@ private:
             return false;
         }
 
+        aclrtStreamAttrValue value;
+        value.failureMode = 1;
+        aclrtSetStreamAttribute(aicpuStream, ACL_STREAM_ATTR_FAILURE_MODE, &value);
+
         bool ok = ExecuteAicpuQuery(aicpuStream, streamsAddr, workspaceAddr);
         aclrtDestroyStream(aicpuStream);
 
