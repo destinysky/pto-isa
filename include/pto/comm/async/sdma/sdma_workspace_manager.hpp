@@ -105,6 +105,9 @@ public:
         if (inited_)
             return true;
 
+        aborted_ = false;
+        query_quiesced_ = true;
+        transport_quiesced_ = true;
         if (!LoadDynamicSymbols())
             return false;
         if (!CreateStarsStreams(detail::kSdmaMaxChan))
@@ -113,15 +116,109 @@ public:
             return false;
         if (!CopyOpResToDevice())
             return false;
-        if (!LaunchAicpuKernel(reinterpret_cast<uint64_t>(opResDevicePtr_), opResInfo_.workspace_addr))
+        if (LaunchAicpuKernel(reinterpret_cast<uint64_t>(opResDevicePtr_), opResInfo_.workspace_addr) != 0)
             return false;
 
         inited_ = true;
         return true;
     }
 
+    struct AbortReport {
+        uint32_t channels{0};
+        uint32_t stopped{0};
+        int32_t first_rc{0};
+        int32_t failed_channel{-1};
+    };
+
+    // All producers are fenced before this operation. Only successful Abort
+    // of every owned stream establishes transport stop/discard completion.
+    AbortReport AbortStreams()
+    {
+        aborted_ = false;
+        transport_quiesced_ = false;
+        AbortReport report;
+        report.channels = static_cast<uint32_t>(streams_.size());
+        using AbortFn = aclError (*)(aclrtStream);
+        auto abort = reinterpret_cast<AbortFn>(dlsym(RTLD_DEFAULT, "aclrtStreamAbort"));
+        if (!inited_ || !query_quiesced_ || report.channels != detail::kSdmaMaxChan || !abort) {
+            report.first_rc = -1;
+            return report;
+        }
+        aclrtContext current = nullptr;
+        report.first_rc = aclrtGetCurrentContext(&current);
+        if (report.first_rc != 0)
+            return report;
+        for (const auto& info : streams_) {
+            if (info.ctx_ != reinterpret_cast<uint64_t>(current)) {
+                report.first_rc = -1;
+                return report;
+            }
+        }
+        for (uint32_t i = 0; i < report.channels; ++i) {
+            const aclError rc = abort(reinterpret_cast<aclrtStream>(streams_[i].stream_));
+            if (rc == ACL_SUCCESS)
+                ++report.stopped;
+            else if (report.first_rc == 0) {
+                report.first_rc = rc;
+                report.failed_channel = static_cast<int32_t>(i);
+            }
+            if (rc != ACL_SUCCESS)
+                std::cerr << "[PTO_RECOVERY] SDMA_STREAM_ABORT_FAILED channel=" << i
+                          << " stream_id=" << streams_[i].stream_id << " rc=" << rc << std::endl;
+        }
+        transport_quiesced_ = report.first_rc == 0 && report.stopped == report.channels;
+        aborted_ = transport_quiesced_;
+        return report;
+    }
+
+    // The owner has fenced every producer. Successful Abort of all local
+    // streams precedes workspace writes. This consumes the local stop proof;
+    // it does not acknowledge peer preparation or reopen execution admission.
+    int32_t RearmAfterAbort(int32_t timeoutMs)
+    {
+        if (!inited_ || !aborted_ || timeoutMs <= 0)
+            return -1;
+        aborted_ = false;
+        for (auto& info : streams_) {
+            auto stream = reinterpret_cast<aclrtStream>(info.stream_);
+            int32_t rc = pRtStreamGetSqid_(stream, &info.sq_id);
+            if (rc != 0)
+                return rc;
+            rc = pRtStreamGetCqid_(stream, &info.cq_id, &info.logic_cq_id);
+            if (rc != 0)
+                return rc;
+            rc = aclrtStreamGetId(stream, &info.stream_id);
+            if (rc != 0)
+                return rc;
+        }
+        const size_t bytes = streams_.size() * sizeof(detail::HostStreamInfo);
+        int32_t rc = aclrtMemcpy(streamsDevicePtr_, bytes, streams_.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+        if (rc != 0)
+            return rc;
+        rc = aclrtMemset(GetWorkspaceAddr(), kSdmaWorkspaceBytes, 0, kSdmaWorkspaceBytes);
+        if (rc != 0)
+            return rc;
+        return LaunchAicpuKernel(reinterpret_cast<uint64_t>(opResDevicePtr_), opResInfo_.workspace_addr, timeoutMs);
+    }
+
+    // Unproven transport/query retirement transfers device reclamation to
+    // the terminal device lifecycle. No device allocation is released here.
+    void AbandonToDeviceLifecycle()
+    {
+        streamsDevicePtr_ = nullptr;
+        opResDevicePtr_ = nullptr;
+        streams_.clear();
+        opResInfo_ = {};
+        CloseDynamicLibs();
+        inited_ = false;
+    }
+
     void Finalize()
     {
+        if (!query_quiesced_ || !transport_quiesced_) {
+            AbandonToDeviceLifecycle();
+            return;
+        }
         if (streamsDevicePtr_) {
             aclrtFree(streamsDevicePtr_);
             streamsDevicePtr_ = nullptr;
@@ -150,6 +247,9 @@ public:
 
 private:
     bool inited_{false};
+    bool aborted_{false};
+    bool query_quiesced_{true};
+    bool transport_quiesced_{true};
     detail::SdmaOpResInfo opResInfo_{};
     void* opResDevicePtr_{nullptr};
     std::vector<detail::HostStreamInfo> streams_;
@@ -370,31 +470,34 @@ private:
         return true;
     }
 
-    bool CreateAclTensor(const std::vector<uint64_t>& hostData, const std::vector<int64_t>& shape, TensorGuard& guard)
+    int32_t CreateAclTensor(
+        const std::vector<uint64_t>& hostData, const std::vector<int64_t>& shape, TensorGuard& guard)
     {
         uint64_t elemCount = 0;
         if (!CalculateElementCount(shape, elemCount)) {
-            return false;
+            return -1;
         }
         if (elemCount != hostData.size()) {
             std::cerr << "[SDMA] CreateAclTensor hostData size mismatch, elemCount=" << elemCount
                       << ", hostData.size=" << hostData.size() << std::endl;
-            return false;
+            return -1;
         }
         if (elemCount > std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
             std::cerr << "[SDMA] CreateAclTensor totalBytes overflow" << std::endl;
-            return false;
+            return -1;
         }
         size_t totalBytes = static_cast<size_t>(elemCount * sizeof(uint64_t));
 
-        if (aclrtMalloc(&guard.deviceAddr, totalBytes, ACL_MEM_MALLOC_HUGE_FIRST) != 0) {
+        int32_t rc = aclrtMalloc(&guard.deviceAddr, totalBytes, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (rc != 0) {
             std::cerr << "[SDMA] CreateAclTensor aclrtMalloc failed" << std::endl;
-            return false;
+            return rc;
         }
-        if (aclrtMemcpy(guard.deviceAddr, totalBytes, hostData.data(), totalBytes, ACL_MEMCPY_HOST_TO_DEVICE) != 0) {
+        rc = aclrtMemcpy(guard.deviceAddr, totalBytes, hostData.data(), totalBytes, ACL_MEMCPY_HOST_TO_DEVICE);
+        if (rc != 0) {
             std::cerr << "[SDMA] CreateAclTensor aclrtMemcpy failed" << std::endl;
             guard.Release();
-            return false;
+            return rc;
         }
 
         std::vector<int64_t> strides(shape.size(), 1);
@@ -408,74 +511,78 @@ private:
         if (!guard.tensor) {
             std::cerr << "[SDMA] aclCreateTensor failed" << std::endl;
             guard.Release();
-            return false;
+            return -1;
         }
-        return true;
+        return 0;
     }
 
-    bool ExecuteAicpuQuery(aclrtStream aicpuStream, uint64_t streamsAddr, uint64_t workspaceAddr)
+    int32_t ExecuteAicpuQuery(aclrtStream aicpuStream, uint64_t streamsAddr, uint64_t workspaceAddr, int32_t timeoutMs)
     {
         TensorGuard inputGuard, outputGuard;
-        std::vector<int64_t> inShape = {2};
-        std::vector<int64_t> outShape = {1};
-        std::vector<uint64_t> inData = {streamsAddr, workspaceAddr};
-        std::vector<uint64_t> outData = {0};
-
-        if (!CreateAclTensor(inData, inShape, inputGuard))
-            return false;
-        if (!CreateAclTensor(outData, outShape, outputGuard))
-            return false;
+        int32_t rc = CreateAclTensor({streamsAddr, workspaceAddr}, {2}, inputGuard);
+        if (rc != 0)
+            return rc;
+        rc = CreateAclTensor({0}, {1}, outputGuard);
+        if (rc != 0) {
+            inputGuard.Release();
+            return rc;
+        }
 
         uint64_t aclnnWsSize = 0;
         aclOpExecutor* executor = nullptr;
-        if (pAclnnGetWsSize_(inputGuard.tensor, outputGuard.tensor, &aclnnWsSize, &executor) != 0) {
-            std::cerr << "[SDMA] aclnnShmemSdmaStarsQueryGetWorkspaceSize failed" << std::endl;
-            return false;
-        }
-
+        rc = pAclnnGetWsSize_(inputGuard.tensor, outputGuard.tensor, &aclnnWsSize, &executor);
         void* aclnnWs = nullptr;
-        if (aclnnWsSize > 0) {
-            if (aclrtMalloc(&aclnnWs, aclnnWsSize, ACL_MEM_MALLOC_HUGE_FIRST) != 0) {
-                std::cerr << "[SDMA] aclrtMalloc aclnn workspace failed" << std::endl;
-                return false;
-            }
+        if (rc == 0 && aclnnWsSize > 0)
+            rc = aclrtMalloc(&aclnnWs, aclnnWsSize, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (rc != 0) {
+            inputGuard.Release();
+            outputGuard.Release();
+            return rc;
         }
 
-        bool ok = false;
-        if (pAclnnExec_(aclnnWs, aclnnWsSize, executor, aicpuStream) != 0) {
-            std::cerr << "[SDMA] aclnnShmemSdmaStarsQuery exec failed" << std::endl;
-        } else if (aclrtSynchronizeStream(aicpuStream) != 0) {
-            std::cerr << "[SDMA] aclrtSynchronizeStream (aicpu) failed" << std::endl;
-        } else {
-            ok = true;
+        rc = pAclnnExec_(aclnnWs, aclnnWsSize, executor, aicpuStream);
+        if (rc == 0)
+            rc = timeoutMs > 0 ? aclrtSynchronizeStreamWithTimeout(aicpuStream, timeoutMs) :
+                                 aclrtSynchronizeStream(aicpuStream);
+        if (rc != 0) {
+            std::cerr << "[PTO_RECOVERY] SDMA_QUERY_FAILED rc=" << rc << std::endl;
+            using AbortFn = aclError (*)(aclrtStream);
+            auto abort = reinterpret_cast<AbortFn>(dlsym(RTLD_DEFAULT, "aclrtStreamAbort"));
+            const int32_t stopRc = abort ? abort(aicpuStream) : -1;
+            query_quiesced_ = stopRc == ACL_SUCCESS;
+            std::cerr << "[PTO_RECOVERY] SDMA_QUERY_STOP_RESULT rc=" << stopRc << std::endl;
+            // An unretired query may still access every device allocation.
+            // Terminal device cleanup owns them when Abort cannot prove stop.
+            if (!query_quiesced_)
+                return rc;
         }
-
         if (aclnnWs)
             aclrtFree(aclnnWs);
         inputGuard.Release();
         outputGuard.Release();
-        return ok;
+        return rc;
     }
 
-    bool LaunchAicpuKernel(uint64_t streamsAddr, uint64_t workspaceAddr)
+    int32_t LaunchAicpuKernel(uint64_t streamsAddr, uint64_t workspaceAddr, int32_t timeoutMs = 0)
     {
         aclrtStream aicpuStream = nullptr;
-        if (aclrtCreateStreamWithConfig(&aicpuStream, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC) != 0) {
-            std::cerr << "[SDMA] aclrtCreateStreamWithConfig (aicpu) failed" << std::endl;
-            return false;
-        }
+        int32_t rc = aclrtCreateStreamWithConfig(&aicpuStream, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
+        if (rc != 0)
+            return rc;
 
-        aclrtStreamAttrValue value;
+        aclrtStreamAttrValue value{};
         value.failureMode = 1;
-        aclrtSetStreamAttribute(aicpuStream, ACL_STREAM_ATTR_FAILURE_MODE, &value);
-
-        bool ok = ExecuteAicpuQuery(aicpuStream, streamsAddr, workspaceAddr);
-        aclrtDestroyStream(aicpuStream);
-
-        if (ok) {
-            std::cerr << "[SDMA] STARS query AICPU kernel completed OK" << std::endl;
+        rc = aclrtSetStreamAttribute(aicpuStream, ACL_STREAM_ATTR_FAILURE_MODE, &value);
+        if (rc == 0)
+            rc = ExecuteAicpuQuery(aicpuStream, streamsAddr, workspaceAddr, timeoutMs);
+        if (query_quiesced_) {
+            const int32_t destroyRc = aclrtDestroyStream(aicpuStream);
+            if (rc == 0)
+                rc = destroyRc;
         }
-        return ok;
+        if (rc == 0)
+            std::cerr << "[SDMA] STARS query AICPU kernel completed OK" << std::endl;
+        return rc;
     }
 };
 
